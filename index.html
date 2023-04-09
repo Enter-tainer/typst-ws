@@ -10,13 +10,12 @@
 <body>
   <div id="imageContainer"></div>
   <script>
-    // 创建一个WebSocket连接到 127.0.0.1:8080
     // 0: should receive json
     let cnt = 0;
     let meta_data = null;
     let canvas_handle = []
   
-    const socket = new WebSocket('ws://127.0.0.1:8080')
+    const socket = new WebSocket('ws://127.0.0.1:23625')
     socket.binaryType = "arraybuffer";
     const imageContainer = document.getElementById('imageContainer')
     socket.addEventListener('open', () => {
