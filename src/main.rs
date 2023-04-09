@@ -1,10 +1,18 @@
 mod args;
 
-use futures::{
-    channel::mpsc::{channel, Receiver},
-    SinkExt, StreamExt,
-};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use clap::Parser;
+use codespan_reporting::diagnostic::{Diagnostic, Label};
+use codespan_reporting::term::{self, termcolor};
+use comemo::Prehashed;
+use elsa::FrozenVec;
+use futures::SinkExt;
+use log::{error, info};
+use memmap2::Mmap;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use once_cell::unsync::OnceCell;
+use same_file::Handle;
+use serde::Serialize;
+use siphasher::sip128::{Hasher128, SipHasher};
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -13,19 +21,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-
-use base64::engine::general_purpose;
-use base64::Engine;
-use clap::Parser;
-use codespan_reporting::diagnostic::{Diagnostic, Label};
-use codespan_reporting::term::{self, termcolor};
-use comemo::Prehashed;
-use elsa::FrozenVec;
-use log::info;
-use memmap2::Mmap;
-use once_cell::unsync::OnceCell;
-use same_file::{Handle};
-use siphasher::sip128::{Hasher128, SipHasher};
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -189,22 +184,6 @@ where
     let mut i = 0;
     move |item| (f(i, item), i += 1).0
 }
-fn async_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<Event>>)> {
-    let (mut tx, rx) = channel(1);
-
-    // Automatically select the best implementation for your platform.
-    // You can also access each implementation directly e.g. INotifyWatcher.
-    let watcher = RecommendedWatcher::new(
-        move |res| {
-            futures::executor::block_on(async {
-                tx.send(res).await.unwrap();
-            })
-        },
-        notify::Config::default(),
-    )?;
-
-    Ok((watcher, rx))
-}
 
 /// Execute a compilation command.
 async fn watch(
@@ -234,8 +213,18 @@ async fn watch(
             broadcast_result(conns, imgs).await;
         });
     }
-    let (mut watcher, mut rx) = async_watcher().unwrap();
-
+    // Setup file watching.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |res: Result<notify::Event, _>| match res {
+            Ok(e) => {
+                tx.send(e).unwrap();
+            }
+            Err(e) => error!("watch error: {:#}", e),
+        },
+        notify::Config::default(),
+    )
+    .map_err(|_| "failed to watch directory")?;
     // Add a path to be watched. All files and directories at that path and
     // below will be monitored for changes.
     watcher
@@ -245,21 +234,26 @@ async fn watch(
     // Handle events.
     info!("start watching files...");
     loop {
-        while let Some(event) = rx.next().await {
-            let event = event.map_err(|_| "failed to watch directory")?;
-            if world.relevant(&event) {
-                break;
-            }
-        }
-
-        let imgs: Vec<_> = compile_once(&mut world, &command)?;
+        let mut recompile = false;
+        let mut events = vec![];
+        while let Ok(e) =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await
         {
-            let conns = conns.clone();
-            tokio::spawn(async move {
-                broadcast_result(conns, imgs).await;
-            });
+            events.push(e);
         }
-        comemo::evict(30);
+        for event in events.into_iter().flatten() {
+            recompile |= world.relevant(&event);
+        }
+        if recompile {
+            let imgs: Vec<_> = compile_once(&mut world, &command)?;
+            {
+                let conns = conns.clone();
+                tokio::spawn(async move {
+                    broadcast_result(conns, imgs).await;
+                });
+            }
+            comemo::evict(30);
+        }
     }
 }
 
@@ -267,20 +261,28 @@ async fn broadcast_result(
     conns: Arc<Mutex<Vec<WebSocketStream<TcpStream>>>>,
     imgs: Vec<tiny_skia::Pixmap>,
 ) {
-    let imgs: Vec<_> = imgs
-        .iter()
-        .map(|page| {
-            let b64_str = general_purpose::STANDARD_NO_PAD.encode(page.encode_png().unwrap());
-            format!("data:image/png;base64,{b64_str}")
-        })
-        .collect();
-    let json = serde_json::to_string(&imgs).unwrap();
-    info!("render done, sending to clients");
     let mut conn_lock = conns.lock().await;
+    info!("render done, sending to {} clients", conn_lock.len());
     let mut to_be_remove: Vec<usize> = vec![];
     for (i, conn) in conn_lock.iter_mut().enumerate() {
-        if conn.send(Message::Text(json.clone())).await.is_err() {
+        #[derive(Debug, Serialize)]
+        struct Info {
+            page_num: usize,
+            width: u32,
+            height: u32,
+        }
+        let json = serde_json::to_string(&Info {
+            page_num: imgs.len(),
+            width: imgs[0].width(),
+            height: imgs[0].height(),
+        })
+        .unwrap();
+        if let Err(err) = conn.send(Message::Text(json)).await {
+            error!("failed to send to client: {}", err);
             to_be_remove.push(i);
+        }
+        for page in imgs.iter() {
+            let _ = conn.send(Message::Binary(page.data().to_vec())).await; // don't care result here
         }
     }
     // remove
@@ -400,27 +402,6 @@ fn print_diagnostics(
 
             term::emit(&mut w, &config, world, &help)?;
         }
-    }
-
-    Ok(())
-}
-
-/// Opens the given file using:
-/// - The default file viewer if `open` is `None`.
-/// - The given viewer provided by `open` if it is `Some`.
-fn open_file(open: Option<&str>, path: &Path) -> StrResult<()> {
-    if let Some(app) = open {
-        open::with(path, app).map_err(|err| {
-            format!(
-                "failed to open `{}` with `{}`, reason: {}",
-                path.display(),
-                app,
-                err
-            )
-        })?;
-    } else {
-        open::that(path)
-            .map_err(|err| format!("failed to open `{}`, reason: {}", path.display(), err))?;
     }
 
     Ok(())
@@ -578,7 +559,7 @@ impl SystemWorld {
         id
     }
 
-    fn relevant(&mut self, event: &notify::Event) -> bool {
+    fn relevant(&self, event: &notify::Event) -> bool {
         match &event.kind {
             notify::EventKind::Any => {}
             notify::EventKind::Access(_) => return false,

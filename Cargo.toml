@@ -34,12 +34,11 @@ open = "4.0.1"
 tokio = {version = "1.27.0", features = ["full"]}
 tokio-tungstenite = "0.18.0"
 tiny-skia = "0.6.6"
-base64 = "0.21.0"
 env_logger = "0.10.0"
 log = "0.4.17"
-futures-util = "0.3.28"
 serde_json = "1.0.95"
 futures = "0.3.28"
+serde = "1.0.159"
 
 [build-dependencies]
 clap = { version = "4.2.1", features = ["derive", "string"] }
