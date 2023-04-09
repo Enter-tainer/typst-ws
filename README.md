@@ -12,7 +12,9 @@ The bottleneck is the pdf viewer. `typst watch` is not fast enough to preview th
 
 ## How?
 
-We follow the similar approach as typst.app by rendering the doc to framebuffers. And render them in a web browser.
+We follow the similar approach as typst.app, by rendering the doc to framebuffers. And send them through websocket to the browser.
+
+Note: Most of the code is directly copy-pasted from https://github.com/typst/typst/tree/main/cli
 ## Usage
 
 ```
@@ -20,3 +22,7 @@ cargo run --release -- watch ./test.typ
 ```
 
 Then open `index.html` in your browser.
+
+## See also
+
+- https://github.com/Myriad-Dreamin/typst.ts
