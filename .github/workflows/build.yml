@@ -11,13 +11,13 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: typst-ws
-            asset_name: typst-linux-amd64
+            asset_name: typst-ws-linux-amd64
           - os: windows-latest
             artifact_name: typst-ws.exe
-            asset_name: typst-windows-amd64.exe
+            asset_name: typst-ws-windows-amd64.exe
           - os: macos-latest
             artifact_name: typst-ws
-            asset_name: typst-macos-amd64
+            asset_name: typst-ws-macos-amd64
     steps:
       - uses: actions/checkout@v2
       - uses: Swatinem/rust-cache@v1
