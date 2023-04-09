@@ -18,9 +18,14 @@ We follow the similar approach as typst.app, by rendering the doc to framebuffer
 Note: Most of the code is directly copy-pasted from https://github.com/typst/typst/tree/main/cli
 ## Usage
 
+Install from source:
+
+
 ```
 cargo run --release -- watch ./test.typ
 ```
+
+Or download prebuilt binary: https://nightly.link/Enter-tainer/typst-ws/workflows/build/master
 
 Then open `index.html` in your browser.
 
