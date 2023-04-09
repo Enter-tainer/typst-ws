@@ -10,13 +10,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: typst-ws-linux
+            artifact_name: typst-ws
             asset_name: typst-linux-amd64
           - os: windows-latest
             artifact_name: typst-ws.exe
             asset_name: typst-windows-amd64.exe
           - os: macos-latest
-            artifact_name: typst-ws-macos
+            artifact_name: typst-ws
             asset_name: typst-macos-amd64
     steps:
       - uses: actions/checkout@v2
