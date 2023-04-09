@@ -2,6 +2,7 @@
 
 Preview your typst file in instant.
 
+To use this in vscode, take a look at https://github.com/Enter-tainer/typst-preview-vscode
 
 https://user-images.githubusercontent.com/25521218/230773434-5f0137c5-db1a-488f-853e-5fac608efd32.mp4
 
