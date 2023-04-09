@@ -9,7 +9,7 @@ https://user-images.githubusercontent.com/25521218/230773434-5f0137c5-db1a-488f-
 
 ## Why not `typst watch` ?
 
-The bottleneck is the pdf viewer. `typst watch` is not fast enough to preview the pdf file in real time. (You may also choose faster pdf viewer like Zathrua.)
+The bottleneck is the pdf viewer. `typst watch` is not fast enough to preview the pdf file in real time. (You may also choose faster pdf viewer like Zathura.)
 
 ## How?
 
