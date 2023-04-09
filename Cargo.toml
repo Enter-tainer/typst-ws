@@ -5,7 +5,7 @@ authors = ["The Typst Project Developers"]
 edition = "2021"
 
 [[bin]]
-name = "typst"
+name = "typst-ws"
 path = "src/main.rs"
 test = false
 doctest = false
