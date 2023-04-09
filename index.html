@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebSocket Multiple Image Display</title>
+</head>
+
+<body>
+  <div id="imageContainer"></div>
+  <script>
+    // 创建一个WebSocket连接到 127.0.0.1:8080
+    const socket = new WebSocket('ws://127.0.0.1:8080');
+    const imageContainer = document.getElementById('imageContainer');
+
+    // 当WebSocket连接打开时
+    socket.addEventListener('open', () => {
+      console.log('WebSocket connection opened');
+    });
+
+    // 当收到WebSocket数据时
+    socket.addEventListener('message', (event) => {
+      // 解析收到的JSON数组
+      const imageDataArray = JSON.parse(event.data);
+      console.log(`recv ${imageDataArray.length} images`)
+      // 清空之前的图像
+      imageContainer.innerHTML = '';
+
+      // 遍历并显示所有接收到的图像
+      imageDataArray.forEach((base64Image) => {
+        const imageElement = document.createElement('img');
+        imageElement.src = base64Image;
+        imageElement.alt = 'Received Image';
+        imageContainer.appendChild(imageElement);
+      });
+    });
+
+    // 当WebSocket连接关闭时
+    socket.addEventListener('close', () => {
+      console.log('WebSocket connection closed');
+    });
+
+    // 当发生错误时
+    socket.addEventListener('error', (error) => {
+      console.error('WebSocket Error: ', error);
+    });
+  </script>
+</body>
+
+</html>

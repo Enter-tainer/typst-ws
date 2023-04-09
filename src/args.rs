@@ -14,6 +14,10 @@ pub struct CliArguments {
     #[clap(long = "root", value_name = "DIR")]
     pub root: Option<PathBuf>,
 
+    /// Configure the websocket path
+    #[clap(long = "host")]
+    pub host: Option<String>,
+
     /// The typst command to run
     #[command(subcommand)]
     pub command: Command,

@@ -1,27 +1,41 @@
 mod args;
 
+use futures::{
+    channel::mpsc::{channel, Receiver},
+    SinkExt, StreamExt,
+};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::hash::Hash;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::str::FromStr;
+use std::sync::Arc;
 
+use base64::engine::general_purpose;
+use base64::Engine;
 use clap::Parser;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::term::{self, termcolor};
 use comemo::Prehashed;
 use elsa::FrozenVec;
+use log::info;
 use memmap2::Mmap;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::unsync::OnceCell;
-use same_file::{is_same_file, Handle};
+use same_file::{Handle};
 use siphasher::sip128::{Hasher128, SipHasher};
 use termcolor::{ColorChoice, StandardStream, WriteColor};
+use tokio::net::{TcpListener, TcpStream};
+
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use typst::diag::{FileError, FileResult, SourceError, StrResult};
 use typst::eval::Library;
 use typst::font::{Font, FontBook, FontInfo, FontVariant};
+use typst::geom::RgbaColor;
 use typst::syntax::{Source, SourceId};
 use typst::util::{Buffer, PathExt};
 use typst::World;
@@ -68,7 +82,7 @@ impl CompileSettings {
     /// # Panics
     /// Panics if the command is not a compile or watch command.
     pub fn with_arguments(args: CliArguments) -> Self {
-        let watch = matches!(args.command, Command::Watch(_));
+        let _watch = matches!(args.command, Command::Watch(_));
         let CompileCommand { input } = match args.command {
             Command::Watch(command) => command,
             _ => unreachable!(),
@@ -107,17 +121,54 @@ impl FontsSettings {
 }
 
 /// Entry point.
-fn main() {
+#[tokio::main]
+async fn main() {
+    let _ = env_logger::try_init();
     let arguments = CliArguments::parse();
+    let conns = Arc::new(Mutex::new(Vec::new()));
+    {
+        let conns = conns.clone();
+        let arguments = arguments.clone();
+        tokio::spawn(async {
+            let res = match &arguments.command {
+                Command::Watch(_) => watch(CompileSettings::with_arguments(arguments), conns).await,
+                Command::Fonts(_) => fonts(FontsSettings::with_arguments(arguments)),
+            };
 
-    let res = match &arguments.command {
-        Command::Watch(_) => compile(CompileSettings::with_arguments(arguments)),
-        Command::Fonts(_) => fonts(FontsSettings::with_arguments(arguments)),
-    };
-
-    if let Err(msg) = res {
-        print_error(&msg).expect("failed to print error");
+            if let Err(msg) = res {
+                print_error(&msg).expect("failed to print error");
+            }
+        });
     }
+    let addr = arguments
+        .host
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+
+    // Create the event loop and TCP listener we'll accept connections on.
+    let try_socket = TcpListener::bind(&addr).await;
+    let listener = try_socket.expect("Failed to bind");
+    info!("Listening on: {}", addr);
+
+    while let Ok((stream, _)) = listener.accept().await {
+        let conn = accept_connection(stream).await;
+        {
+            conns.lock().await.push(conn);
+        }
+    }
+}
+
+async fn accept_connection(stream: TcpStream) -> WebSocketStream<TcpStream> {
+    let addr = stream
+        .peer_addr()
+        .expect("connected streams should have a peer address");
+    info!("Peer address: {}", addr);
+
+    let ws_stream = tokio_tungstenite::accept_async(stream)
+        .await
+        .expect("Error during the websocket handshake occurred");
+
+    info!("New WebSocket connection: {}", addr);
+    ws_stream
 }
 
 /// Print an application-level error (independent from a source file).
@@ -131,9 +182,35 @@ fn print_error(msg: &str) -> io::Result<()> {
     w.reset()?;
     writeln!(w, ": {msg}.")
 }
+fn with_index<T, F>(mut f: F) -> impl FnMut(&T) -> bool
+where
+    F: FnMut(usize, &T) -> bool,
+{
+    let mut i = 0;
+    move |item| (f(i, item), i += 1).0
+}
+fn async_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<Event>>)> {
+    let (mut tx, rx) = channel(1);
+
+    // Automatically select the best implementation for your platform.
+    // You can also access each implementation directly e.g. INotifyWatcher.
+    let watcher = RecommendedWatcher::new(
+        move |res| {
+            futures::executor::block_on(async {
+                tx.send(res).await.unwrap();
+            })
+        },
+        notify::Config::default(),
+    )?;
+
+    Ok((watcher, rx))
+}
 
 /// Execute a compilation command.
-fn compile(mut command: CompileSettings) -> StrResult<()> {
+async fn watch(
+    command: CompileSettings,
+    conns: Arc<Mutex<Vec<WebSocketStream<TcpStream>>>>,
+) -> StrResult<()> {
     let root = if let Some(root) = &command.root {
         root.clone()
     } else if let Some(dir) = command
@@ -150,51 +227,71 @@ fn compile(mut command: CompileSettings) -> StrResult<()> {
 
     // Create the world that serves sources, fonts and files.
     let mut world = SystemWorld::new(root, &command.font_paths);
-
-    // Perform initial compilation.
-    let failed = compile_once(&mut world, &command)?;
-
-    if !command.watch {
-        // Return with non-zero exit code in case of error.
-        if failed {
-            process::exit(1);
-        }
-
-        return Ok(());
+    let imgs: Vec<_> = compile_once(&mut world, &command)?;
+    {
+        let conns = conns.clone();
+        tokio::spawn(async move {
+            broadcast_result(conns, imgs).await;
+        });
     }
+    let (mut watcher, mut rx) = async_watcher().unwrap();
 
-    // Setup file watching.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())
-        .map_err(|_| "failed to watch directory")?;
-
-    // Watch root directory recursively.
+    // Add a path to be watched. All files and directories at that path and
+    // below will be monitored for changes.
     watcher
         .watch(&world.root, RecursiveMode::Recursive)
-        .map_err(|_| "failed to watch directory")?;
+        .unwrap();
 
     // Handle events.
-    let timeout = std::time::Duration::from_millis(100);
+    info!("start watching files...");
     loop {
-        let mut recompile = false;
-        for event in rx
-            .recv()
-            .into_iter()
-            .chain(std::iter::from_fn(|| rx.recv_timeout(timeout).ok()))
-        {
+        while let Some(event) = rx.next().await {
             let event = event.map_err(|_| "failed to watch directory")?;
-            recompile |= world.relevant(&event);
+            if world.relevant(&event) {
+                break;
+            }
         }
 
-        if recompile {
-            compile_once(&mut world, &command)?;
-            comemo::evict(30);
+        let imgs: Vec<_> = compile_once(&mut world, &command)?;
+        {
+            let conns = conns.clone();
+            tokio::spawn(async move {
+                broadcast_result(conns, imgs).await;
+            });
         }
+        comemo::evict(30);
     }
 }
 
+async fn broadcast_result(
+    conns: Arc<Mutex<Vec<WebSocketStream<TcpStream>>>>,
+    imgs: Vec<tiny_skia::Pixmap>,
+) {
+    let imgs: Vec<_> = imgs
+        .iter()
+        .map(|page| {
+            let b64_str = general_purpose::STANDARD_NO_PAD.encode(page.encode_png().unwrap());
+            format!("data:image/png;base64,{b64_str}")
+        })
+        .collect();
+    let json = serde_json::to_string(&imgs).unwrap();
+    info!("render done, sending to clients");
+    let mut conn_lock = conns.lock().await;
+    let mut to_be_remove: Vec<usize> = vec![];
+    for (i, conn) in conn_lock.iter_mut().enumerate() {
+        if conn.send(Message::Text(json.clone())).await.is_err() {
+            to_be_remove.push(i);
+        }
+    }
+    // remove
+    conn_lock.retain(with_index(|index, _item| !to_be_remove.contains(&index)));
+}
+
 /// Compile a single time.
-fn compile_once(world: &mut SystemWorld, command: &CompileSettings) -> StrResult<bool> {
+fn compile_once(
+    world: &mut SystemWorld,
+    command: &CompileSettings,
+) -> StrResult<Vec<tiny_skia::Pixmap>> {
     status(command, Status::Compiling).unwrap();
 
     world.reset();
@@ -203,20 +300,28 @@ fn compile_once(world: &mut SystemWorld, command: &CompileSettings) -> StrResult
         .map_err(|err| err.to_string())?;
 
     match typst::compile(world) {
-        // Export the PDF.
+        // Export the images.
         Ok(document) => {
-            let buffer = typst::export::pdf(&document);
-            // TODO: compile to imgs
-            // fs::write(&command.output, buffer).map_err(|_| "failed to write PDF file")?;
+            let pixmaps: Vec<_> = document
+                .pages
+                .iter()
+                .map(|frame| {
+                    typst::export::render(
+                        frame,
+                        2.0,
+                        typst::geom::Color::Rgba(RgbaColor::from_str("ffffff").unwrap()),
+                    )
+                })
+                .collect();
             status(command, Status::Success).unwrap();
-            Ok(false)
+            Ok(pixmaps)
         }
 
         // Print diagnostics.
         Err(errors) => {
             status(command, Status::Error).unwrap();
             print_diagnostics(world, *errors).map_err(|_| "failed to print diagnostics")?;
-            Ok(true)
+            Ok(vec![])
         }
     }
 }
@@ -227,30 +332,15 @@ fn status(command: &CompileSettings, status: Status) -> io::Result<()> {
         return Ok(());
     }
 
-    let esc = 27 as char;
+    let _esc = 27 as char;
     let input = command.input.display();
     let time = chrono::offset::Local::now();
-    let timestamp = time.format("%H:%M:%S");
+    let _timestamp = time.format("%H:%M:%S");
     let message = status.message();
-    let color = status.color();
+    let _color = status.color();
 
-    let mut w = StandardStream::stderr(ColorChoice::Auto);
-    write!(w, "{esc}c{esc}[1;1H")?;
-
-    w.set_color(&color)?;
-    write!(w, "watching")?;
-    w.reset()?;
-    writeln!(w, " {input}")?;
-
-    w.set_color(&color)?;
-    write!(w, "writing to")?;
-    w.reset()?;
-
-    writeln!(w)?;
-    writeln!(w, "[{timestamp}] {message}")?;
-    writeln!(w)?;
-
-    w.flush()
+    info!("{}: {}", input, message);
+    Ok(())
 }
 
 /// The status in which the watcher can be.
