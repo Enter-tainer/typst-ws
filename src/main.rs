@@ -246,7 +246,7 @@ async fn watch(
         }
         if recompile {
             let imgs: Vec<_> = compile_once(&mut world, &command)?;
-            {
+            if !imgs.is_empty() {
                 let conns = conns.clone();
                 tokio::spawn(async move {
                     broadcast_result(conns, imgs).await;
