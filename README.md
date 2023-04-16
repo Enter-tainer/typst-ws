@@ -1,3 +1,4 @@
+# This repo has been moved to https://github.com/Enter-tainer/typst-preview-vscode !
 # typst-ws
 
 Preview your typst file in instant.
